@@ -1,0 +1,45 @@
+name: demo
+
+services:
+  tele:
+    image: mlan/asterisk
+    network_mode: bridge                    # Only here to help testing
+    cap_add:
+      - sys_ptrace                          # Only here to help testing
+      - net_admin                           # Allow NFT, used by AutoBan
+      - net_raw                             # Allow NFT, used by AutoBan
+    ports:
+      - "${SMS_PORT-8080}:${WEBSMSD_PORT:-80}" # WEBSMSD port mapping
+      - "5060:5060/udp"                     # SIP UDP port
+      - "5060:5060"                         # SIP TCP port
+      - "5061:5061"                         # SIP TLS port
+      - "10000-10099:10000-10099/udp"       # RTP ports
+    environment:
+      - SYSLOG_LEVEL=${SYSLOG_LEVEL-4}      # Logging
+      - HOSTNAME=${TELE_SRV-tele}.${DOMAIN-docker.localhost}
+      - PULSE_SERVER=unix:/run/pulse/socket # Use host audio
+      - PULSE_COOKIE=/run/pulse/cookie      # Use host audio
+      - WEBSMSD_PORT=${WEBSMSD_PORT-80}     # WEBSMSD internal port
+    volumes:
+      - tele-conf:/srv                      # Persistent storage
+      - ./pulse:/run/pulse                  # Use host audio
+      - /etc/localtime:/etc/localtime:ro    # Use host timezone
+
+  aiagent-bridge:
+    build: ../src/aiagent/bridge          # AudioSocket <-> OpenAI Realtime bridge for extension 1001
+    network_mode: "service:tele"          # share tele's netns: reachable at 127.0.0.1:9092 (tele uses network_mode:bridge, no DNS)
+    depends_on:
+      - tele
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_REALTIME_MODEL=${OPENAI_REALTIME_MODEL-gpt-realtime}
+      - OPENAI_REALTIME_VOICE=${OPENAI_REALTIME_VOICE-alloy}
+      - AIAGENT_INSTRUCTIONS=${AIAGENT_INSTRUCTIONS-}
+      - AIAGENT_GREETING=${AIAGENT_GREETING-}
+      - OPENAI_REALTIME_SPEED=${OPENAI_REALTIME_SPEED-}
+      - QDRANT_URL=${QDRANT_URL}
+      - QDRANT_API_KEY=${QDRANT_API_KEY}
+      - QDRANT_COLLECTION=${QDRANT_COLLECTION-sasi_college}
+
+volumes:
+  tele-conf:                                # Persistent storage
