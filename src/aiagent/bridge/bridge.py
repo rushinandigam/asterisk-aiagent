@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import queue
+import re
 import struct
 import threading
 import time
@@ -102,6 +103,13 @@ ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID")
 # websocket (confirmed: connection rejected with HTTP 403), so this bridge
 # calls the plain REST TTS endpoint instead, once per agent turn.
 ELEVENLABS_TTS_MODEL = os.environ.get("ELEVENLABS_TTS_MODEL", "eleven_v3")
+# Hybrid model selection: eleven_v3's slowness is only actually needed for
+# replies that contain Telugu script - a reply that comes out purely in
+# English (e.g. mirroring a caller who spoke English) has no reason to pay
+# that latency tax, since the fast model handles English perfectly well.
+# Checked per-turn against the actual reply text, not guessed in advance.
+ELEVENLABS_TTS_MODEL_FAST = os.environ.get("ELEVENLABS_TTS_MODEL_FAST", "eleven_flash_v2_5")
+TELUGU_SCRIPT_RE = re.compile(r"[ఀ-౿]")
 ELEVENLABS_HOST = "api.elevenlabs.io"
 ELEVENLABS_TTS_PATH_TMPL = "/v1/text-to-speech/{voice_id}?output_format=pcm_8000"
 
@@ -317,8 +325,14 @@ async def run_llm_turn(call_id, history):
 
 
 def _elevenlabs_tts_sync(text):
+    # Only pay eleven_v3's latency tax when the reply actually contains
+    # Telugu script - a reply that comes out purely in English/Latin script
+    # (e.g. mirroring a caller who spoke English) synthesizes correctly on
+    # the much faster model, so there's no reason to use the slow one.
+    model = ELEVENLABS_TTS_MODEL if TELUGU_SCRIPT_RE.search(text) else ELEVENLABS_TTS_MODEL_FAST
+    log.info("TTS model selected: %s", model)
     path = ELEVENLABS_TTS_PATH_TMPL.format(voice_id=ELEVENLABS_VOICE_ID)
-    body = json.dumps({"text": text, "model_id": ELEVENLABS_TTS_MODEL}).encode("utf-8")
+    body = json.dumps({"text": text, "model_id": model}).encode("utf-8")
     headers = {"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"}
     # eleven_v3 is meaningfully slower than the low-latency ElevenLabs
     # models (that's the whole reason it's used - it's the only one with
