@@ -26,17 +26,22 @@ services:
       - /etc/localtime:/etc/localtime:ro    # Use host timezone
 
   aiagent-bridge:
-    build: ../src/aiagent/bridge          # AudioSocket <-> OpenAI Realtime bridge for extension 1001
+    build: ../src/aiagent/bridge          # AudioSocket <-> Deepgram STT / OpenAI LLM / ElevenLabs TTS bridge for extension 1001
     network_mode: "service:tele"          # share tele's netns: reachable at 127.0.0.1:9092 (tele uses network_mode:bridge, no DNS)
     depends_on:
       - tele
     environment:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - OPENAI_REALTIME_MODEL=${OPENAI_REALTIME_MODEL-gpt-realtime}
-      - OPENAI_REALTIME_VOICE=${OPENAI_REALTIME_VOICE-alloy}
+      - OPENAI_CHAT_MODEL=${OPENAI_CHAT_MODEL-gpt-4o-mini}
       - AIAGENT_INSTRUCTIONS=${AIAGENT_INSTRUCTIONS-}
       - AIAGENT_GREETING=${AIAGENT_GREETING-}
-      - OPENAI_REALTIME_SPEED=${OPENAI_REALTIME_SPEED-}
+      - DEEPGRAM_API_KEY=${DEEPGRAM_API_KEY}
+      - DEEPGRAM_MODEL=${DEEPGRAM_MODEL-nova-3}
+      - DEEPGRAM_LANGUAGE=${DEEPGRAM_LANGUAGE-te}
+      - DEEPGRAM_ENDPOINTING_MS=${DEEPGRAM_ENDPOINTING_MS-800}
+      - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY}
+      - ELEVENLABS_VOICE_ID=${ELEVENLABS_VOICE_ID}
+      - ELEVENLABS_TTS_MODEL=${ELEVENLABS_TTS_MODEL-eleven_v3}
       - QDRANT_URL=${QDRANT_URL}
       - QDRANT_API_KEY=${QDRANT_API_KEY}
       - QDRANT_COLLECTION=${QDRANT_COLLECTION-sasi_college}
