@@ -3,8 +3,9 @@
 aiagent-bridge
 
 TCP server speaking the Asterisk AudioSocket protocol on one side, and a
-3-stage AI voice pipeline on the other: Deepgram (speech-to-text) -> OpenAI
-chat completions (reasoning + tool-calling) -> ElevenLabs (text-to-speech).
+3-stage AI voice pipeline on the other: Deepgram (speech-to-text) -> an Agno
+Agent (reasoning + tool-calling, backed by OpenAI) -> ElevenLabs
+(text-to-speech).
 
 Asterisk's AudioSocket app() sends/receives raw signed-linear 16-bit PCM,
 mono, at the channel's negotiated rate. extensions_local.conf answers the
@@ -29,10 +30,17 @@ import threading
 import time
 
 import websockets
+from agno.agent import Agent
+from agno.db.in_memory import InMemoryDb
+from agno.models.openai import OpenAIChat
 
 import retriever
 
-logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    format="%(asctime)s.%(msecs)03d %(levelname)s:%(name)s:%(message)s",
+    datefmt="%H:%M:%S",
+)
 log = logging.getLogger("aiagent-bridge")
 
 KIND_HANGUP = 0x00
@@ -56,7 +64,7 @@ OUTBOUND_FRAME_BYTES = ASTERISK_SAMPLE_RATE * SAMPLE_WIDTH * OUTBOUND_FRAME_MS /
 SILENCE_FRAME = b"\x00" * OUTBOUND_FRAME_BYTES
 
 # app_audiosocket.so hangs up after a hardcoded 2000ms of no activity on the
-# socket. The Deepgram -> OpenAI -> ElevenLabs round trip can exceed that
+# socket. The Deepgram -> Agno -> ElevenLabs round trip can exceed that
 # during normal "thinking" pauses, so a keepalive writer fills gaps with
 # silence, same as the previous single-hop Realtime bridge did.
 KEEPALIVE_GAP_SECONDS = 0.5
@@ -76,22 +84,27 @@ DEEPGRAM_MODEL = os.environ.get("DEEPGRAM_MODEL", "nova-3")
 DEEPGRAM_LANGUAGE = os.environ.get("DEEPGRAM_LANGUAGE", "te")
 # ms of trailing silence before Deepgram marks an utterance speech_final -
 # this is our turn-taking boundary, equivalent to the old server_vad's
-# silence_duration_ms. Starting value matches that just-tuned setting; will
-# likely need retuning against real calls the same way that was.
+# silence_duration_ms.
 DEEPGRAM_ENDPOINTING_MS = int(os.environ.get("DEEPGRAM_ENDPOINTING_MS", "800"))
 # Grace period after the agent starts speaking during which barge-in
 # detection is suppressed. On a phone/softphone without a headset (no
 # acoustic echo cancellation), the agent's own TTS audio leaks back into the
 # caller's mic and Deepgram transcribes it, which the bridge would otherwise
 # mistake for the caller interrupting - self-echo risk is highest right at
-# TTS onset, so this ignores that initial window. Same class of issue (and
-# same fix shape) as the old OpenAI Realtime bridge's server_vad tuning.
+# TTS onset, so this ignores that initial window.
 BARGE_IN_GRACE_SECONDS = float(os.environ.get("BARGE_IN_GRACE_SECONDS", "1.2"))
 DEEPGRAM_URL = (
     f"wss://api.deepgram.com/v1/listen?language={DEEPGRAM_LANGUAGE}"
     f"&model={DEEPGRAM_MODEL}&sample_rate={ASTERISK_SAMPLE_RATE}"
     f"&encoding=linear16&channels=1&endpointing={DEEPGRAM_ENDPOINTING_MS}"
     f"&interim_results=true"
+    # speech_final (endpointing-based) has been observed to sometimes never
+    # fire on a real utterance - the caller's turn gets transcribed
+    # correctly but is silently dropped since nothing closes it out.
+    # UtteranceEnd is a separate, word-timing-based silence signal Deepgram
+    # sends independently of endpointing, used below as a fallback so a
+    # turn still completes even if speech_final never arrives.
+    f"&utterance_end_ms=1000"
 )
 
 ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY")
@@ -100,8 +113,10 @@ ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID")
 # the low-latency conversational models (flash_v2_5, multilingual_v2) don't
 # officially support Telugu and were confirmed during development to
 # mispronounce it. v3 also isn't available over ElevenLabs' streaming-input
-# websocket (confirmed: connection rejected with HTTP 403), so this bridge
-# calls the plain REST TTS endpoint instead, once per agent turn.
+# websocket (confirmed: connection rejected with HTTP 403) - but its
+# streaming REST endpoint works fine and gets time-to-first-byte under a
+# second even for v3 (measured ~0.6s vs ~6s total generation time), so this
+# bridge streams the REST response instead of waiting for the whole clip.
 ELEVENLABS_TTS_MODEL = os.environ.get("ELEVENLABS_TTS_MODEL", "eleven_v3")
 # Hybrid model selection: eleven_v3's slowness is only actually needed for
 # replies that contain Telugu script - a reply that comes out purely in
@@ -111,7 +126,7 @@ ELEVENLABS_TTS_MODEL = os.environ.get("ELEVENLABS_TTS_MODEL", "eleven_v3")
 ELEVENLABS_TTS_MODEL_FAST = os.environ.get("ELEVENLABS_TTS_MODEL_FAST", "eleven_flash_v2_5")
 TELUGU_SCRIPT_RE = re.compile(r"[ఀ-౿]")
 ELEVENLABS_HOST = "api.elevenlabs.io"
-ELEVENLABS_TTS_PATH_TMPL = "/v1/text-to-speech/{voice_id}?output_format=pcm_8000"
+ELEVENLABS_TTS_STREAM_PATH_TMPL = "/v1/text-to-speech/{voice_id}/stream?output_format=pcm_8000"
 
 AIAGENT_INSTRUCTIONS = (os.environ.get("AIAGENT_INSTRUCTIONS") or (
     "You are a warm, friendly staff member at SASI (the college at sasi.ac.in) talking to a "
@@ -170,31 +185,53 @@ AIAGENT_INSTRUCTIONS = (os.environ.get("AIAGENT_INSTRUCTIONS") or (
 )
 AIAGENT_GREETING = os.environ.get("AIAGENT_GREETING") or "శశి కళాశాలకు స్వాగతం!"
 
-SEARCH_TOOL = [
-    {
-        "type": "function",
-        "function": {
-            "name": "search_college_info",
-            "description": (
-                "Search SASI college's official website content (courses, departments, "
-                "admissions, fees, facilities, placements, faculty, vision/mission, contact "
-                "info, etc). Always call this before answering any factual question about SASI."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "What to search for, e.g. 'B.Tech CSE fee structure'",
-                    },
-                },
-                "required": ["query"],
-            },
-        },
-    },
-]
 
-MAX_TOOL_ROUNDS = 3
+def search_college_info(query: str) -> str:
+    """Search SASI college's official website content (courses, departments,
+    admissions, fees, facilities, placements, faculty, vision/mission,
+    contact info, etc). Always call this before answering any factual
+    question about SASI.
+
+    Args:
+        query: What to search for, e.g. "B.Tech CSE fee structure"
+    """
+    log.info("tool call search_college_info(%r)", query)
+    results = retriever.search(query)
+    log.info("retrieved %d matching chunk(s)", len(results))
+    if not results:
+        return json.dumps({
+            "results": [],
+            "note": "No matching information found on the SASI website for this query.",
+        })
+    return json.dumps({"results": results})
+
+
+# One shared Agent handles every call; conversation continuity per call
+# comes from passing session_id=call_id into run() - Agno keeps each
+# session's history in the in-memory db, scoped separately per session_id,
+# so concurrent calls never see each other's conversation.
+aiagent = Agent(
+    model=OpenAIChat(id=OPENAI_CHAT_MODEL, api_key=OPENAI_API_KEY, max_tokens=70),
+    db=InMemoryDb(),
+    tools=[search_college_info],
+    instructions=AIAGENT_INSTRUCTIONS,
+    add_history_to_context=True,
+    num_history_runs=10,
+    markdown=False,
+)
+
+
+def _agno_run_sync(call_id, text):
+    result = aiagent.run(text, session_id=call_id)
+    return (result.content or "").strip()
+
+
+async def run_llm_turn(call_id, text):
+    """Runs one turn through the Agno agent (including any tool calls it
+    makes internally) in a background thread, since Agent.run is a
+    blocking call - keeps the event loop free for the keepalive writer and
+    other concurrent calls."""
+    return await asyncio.to_thread(_agno_run_sync, call_id, text)
 
 
 async def read_audiosocket_packet(reader: asyncio.StreamReader):
@@ -208,145 +245,39 @@ def write_audiosocket_packet(writer: asyncio.StreamWriter, kind: int, payload: b
     writer.write(bytes([kind]) + struct.pack(">H", len(payload)) + payload)
 
 
-# Pooled keep-alive HTTPS connections, one pool per host. A single AI turn
-# can make 2-4 API calls in sequence (LLM, maybe a second LLM call after a
-# tool result, then TTS) - urllib.request opens a brand new TCP+TLS
-# connection for every single one, paying a full handshake each time. This
-# reuses connections across calls instead, one small pool per host so
-# multiple simultaneous phone calls don't serialize behind each other.
-_HTTP_POOLS = {}
-_HTTP_POOLS_LOCK = threading.Lock()
-HTTP_POOL_MAX_SIZE = 4
-
-
-def _get_pool(host):
-    with _HTTP_POOLS_LOCK:
-        pool = _HTTP_POOLS.setdefault(host, queue.Queue(maxsize=HTTP_POOL_MAX_SIZE))
-    return pool
-
-
-def _http_post(host, path, headers, body, timeout):
-    """POST body (bytes) to host+path over a pooled keep-alive connection,
-    with one retry on a fresh connection if the pooled one turned out to be
-    stale (closed server-side after sitting idle)."""
-    pool = _get_pool(host)
-    try:
-        conn = pool.get_nowait()
-    except queue.Empty:
-        conn = http.client.HTTPSConnection(host, timeout=timeout)
-
-    for attempt in (1, 2):
-        try:
-            conn.request("POST", path, body=body, headers=headers)
-            resp = conn.getresponse()
-            data = resp.read()
-            status = resp.status
-            break
-        except (http.client.HTTPException, ConnectionError, OSError):
-            conn.close()
-            if attempt == 2:
-                raise
-            conn = http.client.HTTPSConnection(host, timeout=timeout)
-
-    if status >= 400:
-        conn.close()
-        raise RuntimeError(f"{host}{path} returned HTTP {status}: {data[:500]!r}")
-
-    try:
-        pool.put_nowait(conn)
-    except queue.Full:
-        conn.close()
-    return data
-
-
-def _http_post_json(host, path, headers, payload, timeout=30):
-    body = json.dumps(payload).encode("utf-8")
-    data = _http_post(host, path, {**headers, "Content-Type": "application/json"}, body, timeout)
-    return json.loads(data.decode("utf-8"))
-
-
-def _openai_chat_sync(messages):
-    return _http_post_json(
-        "api.openai.com",
-        "/v1/chat/completions",
-        {"Authorization": f"Bearer {OPENAI_API_KEY}"},
-        {
-            "model": OPENAI_CHAT_MODEL,
-            "messages": messages,
-            "tools": SEARCH_TOOL,
-            "tool_choice": "auto",
-            # Hard cap on reply length, not just a prompt suggestion - eleven_v3
-            # (the only ElevenLabs model with confirmed-good Telugu) is slow
-            # enough that a multi-paragraph reply takes noticeably long to
-            # synthesize, even though the keepalive prevents an AudioSocket
-            # timeout. Measured on real calls: TTS generation time scales
-            # with reply length, so a tighter cap directly cuts end-to-end
-            # latency, on top of being better phone etiquette than an
-            # essay-length answer.
-            "max_tokens": 70,
-        },
-        timeout=30,
-    )
-
-
-async def run_llm_turn(call_id, history):
-    """Runs the OpenAI chat-completions + tool-calling loop, mutating
-    `history` in place (assistant/tool messages appended as they happen),
-    and returns the final assistant text for this turn."""
-    for _ in range(MAX_TOOL_ROUNDS):
-        resp = await asyncio.to_thread(_openai_chat_sync, history)
-        msg = resp["choices"][0]["message"]
-        if msg.get("tool_calls"):
-            history.append(msg)
-            for tc in msg["tool_calls"]:
-                try:
-                    args = json.loads(tc["function"]["arguments"] or "{}")
-                except json.JSONDecodeError:
-                    args = {}
-                query = args.get("query", "")
-                log.info("[%s] tool call search_college_info(%r)", call_id, query)
-                results = await asyncio.to_thread(retriever.search, query)
-                log.info("[%s] retrieved %d matching chunk(s)", call_id, len(results))
-                output = {"results": results} if results else {
-                    "results": [],
-                    "note": "No matching information found on the SASI website for this query.",
-                }
-                history.append({
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "content": json.dumps(output),
-                })
-            continue
-        text = (msg.get("content") or "").strip()
-        history.append({"role": "assistant", "content": text})
-        return text
-    log.warning("[%s] hit MAX_TOOL_ROUNDS without a final answer", call_id)
-    return ""
-
-
-def _elevenlabs_tts_sync(text):
-    # Only pay eleven_v3's latency tax when the reply actually contains
-    # Telugu script - a reply that comes out purely in English/Latin script
-    # (e.g. mirroring a caller who spoke English) synthesizes correctly on
-    # the much faster model, so there's no reason to use the slow one.
+def _elevenlabs_tts_stream_sync(text, chunk_queue):
+    """Runs in a background thread. POSTs to ElevenLabs' streaming REST
+    endpoint and pushes raw pcm_8000 chunks onto chunk_queue as they arrive
+    over the network, rather than waiting for the full clip. Even
+    eleven_v3 - meaningfully slower than the low-latency models to fully
+    finish a clip - starts returning bytes in well under a second on this
+    endpoint (measured: ~0.6s time-to-first-byte vs ~6s total), so
+    streaming gets the caller real audio almost immediately without
+    trading away eleven_v3's Telugu quality. Terminates chunk_queue with
+    None on success, or an Exception instance on failure."""
     model = ELEVENLABS_TTS_MODEL if TELUGU_SCRIPT_RE.search(text) else ELEVENLABS_TTS_MODEL_FAST
-    log.info("TTS model selected: %s", model)
-    path = ELEVENLABS_TTS_PATH_TMPL.format(voice_id=ELEVENLABS_VOICE_ID)
+    log.info("TTS model selected: %s (streaming)", model)
+    path = ELEVENLABS_TTS_STREAM_PATH_TMPL.format(voice_id=ELEVENLABS_VOICE_ID)
     body = json.dumps({"text": text, "model_id": model}).encode("utf-8")
     headers = {"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"}
-    # eleven_v3 is meaningfully slower than the low-latency ElevenLabs
-    # models (that's the whole reason it's used - it's the only one with
-    # confirmed-good Telugu output), so this needs more headroom than a
-    # typical REST call; the keepalive writer covers Asterisk's socket
-    # during this wait regardless of how long it takes.
-    return _http_post(ELEVENLABS_HOST, path, headers, body, timeout=60)
-
-
-async def elevenlabs_tts(text):
-    """Blocking REST call to ElevenLabs TTS (eleven_v3 doesn't support the
-    streaming-input websocket), returns raw pcm_8000 bytes ready to frame
-    straight into AudioSocket packets - no resampling needed."""
-    return await asyncio.to_thread(_elevenlabs_tts_sync, text)
+    conn = http.client.HTTPSConnection(ELEVENLABS_HOST, timeout=60)
+    try:
+        conn.request("POST", path, body=body, headers=headers)
+        resp = conn.getresponse()
+        if resp.status >= 400:
+            data = resp.read()
+            raise RuntimeError(f"{ELEVENLABS_HOST}{path} returned HTTP {resp.status}: {data[:500]!r}")
+        while True:
+            chunk = resp.read(4096)
+            if not chunk:
+                break
+            chunk_queue.put(chunk)
+    except Exception as exc:
+        chunk_queue.put(exc)
+        return
+    finally:
+        conn.close()
+    chunk_queue.put(None)
 
 
 async def deepgram_stt_session():
@@ -382,19 +313,39 @@ async def pump_asterisk_to_stt(call_id, reader, stt_ws, hangup_event):
 
 
 async def pump_stt_transcripts(call_id, stt_ws, transcript_queue, state, hangup_event):
-    """Listen for Deepgram Results events. Any non-empty transcript while
-    the agent is speaking is treated as a barge-in; a speech_final result
-    (Deepgram's own end-of-utterance/endpointing signal) is a completed
-    caller turn, queued for the LLM."""
+    """Listen for Deepgram Results/UtteranceEnd events. Any non-empty
+    transcript while the agent is speaking is treated as a barge-in.
+    is_final chunks accumulate into pending_text until the turn closes -
+    either via speech_final (Deepgram's endpointing signal) or, as a
+    fallback, an UtteranceEnd event. speech_final was observed on real
+    calls to sometimes never fire on a genuine utterance (correctly
+    transcribed speech silently dropped, no reply ever sent) - UtteranceEnd
+    is a separate, more reliable silence signal that catches those cases."""
+    pending_text = ""
     try:
         async for message in stt_ws:
             data = json.loads(message)
-            if data.get("type") != "Results":
+            msg_type = data.get("type")
+
+            if msg_type == "UtteranceEnd":
+                if pending_text:
+                    log.info("[%s] timing: UtteranceEnd at %.3f (fallback end-of-turn, speech_final never fired)",
+                              call_id, time.monotonic())
+                    await transcript_queue.put(pending_text)
+                    pending_text = ""
+                continue
+
+            if msg_type != "Results":
                 continue
             alt = data["channel"]["alternatives"][0]
             transcript = alt["transcript"].strip()
             if not transcript:
                 continue
+            log.info(
+                "[%s] STT transcript (is_final=%s, speech_final=%s, conf=%.2f): %r",
+                call_id, data.get("is_final"), data.get("speech_final"),
+                alt.get("confidence", 0.0), transcript,
+            )
             if (
                 state["is_agent_speaking"]
                 and not state["interrupted"]
@@ -402,8 +353,14 @@ async def pump_stt_transcripts(call_id, stt_ws, transcript_queue, state, hangup_
             ):
                 log.info("[%s] caller interrupted - barge-in detected", call_id)
                 state["interrupted"] = True
+            if data.get("is_final"):
+                pending_text = (pending_text + " " + transcript).strip()
             if data.get("speech_final"):
-                await transcript_queue.put(transcript)
+                log.info("[%s] timing: speech_final at %.3f (caller stopped talking, starting reply pipeline)",
+                          call_id, time.monotonic())
+                if pending_text:
+                    await transcript_queue.put(pending_text)
+                    pending_text = ""
     except websockets.exceptions.ConnectionClosed:
         log.info("[%s] Deepgram STT connection closed", call_id)
     finally:
@@ -411,55 +368,82 @@ async def pump_stt_transcripts(call_id, stt_ws, transcript_queue, state, hangup_
         await transcript_queue.put(None)  # unblocks process_turns on hangup
 
 
-async def stream_pcm_to_asterisk(call_id, audio, writer, state, last_write):
-    """Frame raw pcm_8000 bytes into 20ms AudioSocket packets, paced to
-    roughly real-time playback so a barge-in (state['interrupted']) can
-    actually cut off the remaining audio instead of it all being written to
-    the socket instantly."""
-    pending = audio
+async def stream_tts_to_asterisk(call_id, text, writer, state, last_write, turn_start):
+    """Starts the ElevenLabs streaming fetch in a background thread and
+    frames pcm_8000 chunks into 20ms AudioSocket packets as they arrive,
+    paced to roughly real-time playback so a barge-in (state['interrupted'])
+    can actually cut off the remaining audio instead of it all being
+    written to the socket instantly. Audio starts playing on ElevenLabs'
+    time-to-first-byte rather than its total generation time - the
+    keepalive covers the gap up to the first chunk, is_agent_speaking only
+    flips True once real audio is actually in hand."""
+    chunk_queue = queue.Queue()
+    thread = threading.Thread(
+        target=_elevenlabs_tts_stream_sync, args=(text, chunk_queue), daemon=True
+    )
+    thread.start()
+
+    pending = b""
     bytes_out = 0
-    while len(pending) >= OUTBOUND_FRAME_BYTES:
-        if state["interrupted"]:
-            log.info("[%s] TTS playback interrupted by barge-in, stopping early", call_id)
+    first_chunk_at = None
+    while True:
+        try:
+            item = await asyncio.wait_for(asyncio.to_thread(chunk_queue.get), timeout=10)
+        except asyncio.TimeoutError:
+            log.warning("[%s] TTS stream stalled - no data for 10s", call_id)
             break
-        frame, pending = pending[:OUTBOUND_FRAME_BYTES], pending[OUTBOUND_FRAME_BYTES:]
-        write_audiosocket_packet(writer, KIND_AUDIO, frame)
-        bytes_out += len(frame)
-        await writer.drain()
-        last_write[0] = time.monotonic()
-        await asyncio.sleep(OUTBOUND_FRAME_MS / 1000)
+        if item is None:
+            break
+        if isinstance(item, Exception):
+            log.error("[%s] TTS streaming error: %r", call_id, item)
+            break
+        if first_chunk_at is None:
+            first_chunk_at = time.monotonic()
+            log.info("[%s] timing: first TTS audio chunk after %.2fs", call_id, first_chunk_at - turn_start)
+            state["is_agent_speaking"] = True
+            state["speaking_started_at"] = first_chunk_at
+        pending += item
+        while len(pending) >= OUTBOUND_FRAME_BYTES:
+            if state["interrupted"]:
+                log.info("[%s] TTS playback interrupted by barge-in, stopping early", call_id)
+                pending = b""
+                break
+            frame, pending = pending[:OUTBOUND_FRAME_BYTES], pending[OUTBOUND_FRAME_BYTES:]
+            write_audiosocket_packet(writer, KIND_AUDIO, frame)
+            bytes_out += len(frame)
+            await writer.drain()
+            last_write[0] = time.monotonic()
+            await asyncio.sleep(OUTBOUND_FRAME_MS / 1000)
+        if state["interrupted"]:
+            break
     if pending and not state["interrupted"]:
         frame = pending.ljust(OUTBOUND_FRAME_BYTES, b"\x00")
         write_audiosocket_packet(writer, KIND_AUDIO, frame)
         bytes_out += len(frame)
         await writer.drain()
         last_write[0] = time.monotonic()
-    log.info("[%s] wrote %d bytes of agent audio to Asterisk", call_id, bytes_out)
+    log.info("[%s] wrote %d bytes of agent audio to Asterisk (streamed)", call_id, bytes_out)
 
 
-async def speak_turn(call_id, history, writer, state, last_write):
-    """Run one LLM turn to completion and speak the result, honoring
+async def speak_turn(call_id, text, writer, state, last_write):
+    """Run one Agno turn to completion and speak the result, honoring
     barge-in throughout."""
     state["interrupted"] = False
-    reply = await run_llm_turn(call_id, history)
+    turn_start = time.monotonic()
+    reply = await run_llm_turn(call_id, text)
+    llm_done = time.monotonic()
     log.info("[%s] agent said: %s", call_id, reply)
+    log.info("[%s] timing: LLM turn took %.2fs", call_id, llm_done - turn_start)
     if not reply:
         return
     # is_agent_speaking suppresses the keepalive's silence filler, so it
-    # must stay False during the (potentially slow, especially on
-    # eleven_v3) LLM+TTS generation wait - otherwise nothing fills the
-    # AudioSocket while we wait, and Asterisk's own hardcoded 2s inactivity
-    # timeout kills the call before any audio is ever sent. Only flip it
-    # once real audio is in hand and we're about to write it.
+    # must stay False until the streaming TTS fetch actually hands over its
+    # first chunk - otherwise nothing fills the AudioSocket while we wait,
+    # and Asterisk's own hardcoded 2s inactivity timeout kills the call
+    # before any audio is ever sent. stream_tts_to_asterisk flips it once
+    # real audio is in hand.
     try:
-        audio = await elevenlabs_tts(reply)
-    except Exception:
-        log.exception("[%s] TTS generation error", call_id)
-        return
-    state["is_agent_speaking"] = True
-    state["speaking_started_at"] = time.monotonic()
-    try:
-        await stream_pcm_to_asterisk(call_id, audio, writer, state, last_write)
+        await stream_tts_to_asterisk(call_id, reply, writer, state, last_write, llm_done)
     except (ConnectionError, OSError):
         # Caller/Asterisk hung up mid-playback - not an error worth a
         # traceback, just the call ending while audio was still queued.
@@ -470,16 +454,16 @@ async def speak_turn(call_id, history, writer, state, last_write):
         state["is_agent_speaking"] = False
 
 
-async def process_turns(call_id, transcript_queue, writer, hangup_event, state, last_write, history):
+async def process_turns(call_id, transcript_queue, writer, hangup_event, state, last_write):
     """Speaks the pinned greeting first, then processes each completed
     caller turn from the queue sequentially - one call is a single line of
     conversation, no need to handle overlapping LLM turns."""
-    history.append({"role": "user", "content": (
+    greeting_instruction = (
         f"Say, word for word: \"{AIAGENT_GREETING}\" - then, without pausing for a reply, "
         "immediately add ONE brief, engaging point about SASI college in a single short "
         "sentence. Keep the whole reply short overall - this is spoken audio, not text."
-    )})
-    await speak_turn(call_id, history, writer, state, last_write)
+    )
+    await speak_turn(call_id, greeting_instruction, writer, state, last_write)
 
     while not hangup_event.is_set():
         try:
@@ -489,14 +473,14 @@ async def process_turns(call_id, transcript_queue, writer, hangup_event, state, 
         if text is None:
             break
         log.info("[%s] 1002 said: %s", call_id, text)
-        history.append({"role": "user", "content": text})
-        await speak_turn(call_id, history, writer, state, last_write)
+        await speak_turn(call_id, text, writer, state, last_write)
 
 
-async def keepalive_writer(writer, hangup_event, last_write, state):
+async def keepalive_writer(call_id, writer, hangup_event, last_write, state):
     """Fill idle gaps with silence so app_audiosocket's hardcoded 2s inactivity
-    timeout doesn't fire while waiting on the Deepgram/OpenAI/ElevenLabs
+    timeout doesn't fire while waiting on the Deepgram/Agno/ElevenLabs
     round trip. Suppressed while agent audio is actively streaming."""
+    log.info("[%s] keepalive writer started", call_id)
     while not hangup_event.is_set():
         await asyncio.sleep(KEEPALIVE_CHECK_SECONDS)
         if hangup_event.is_set():
@@ -504,12 +488,15 @@ async def keepalive_writer(writer, hangup_event, last_write, state):
         if state["is_agent_speaking"]:
             continue
         if time.monotonic() - last_write[0] >= KEEPALIVE_GAP_SECONDS:
+            log.info("[%s] keepalive: filling idle gap with silence", call_id)
             write_audiosocket_packet(writer, KIND_AUDIO, SILENCE_FRAME)
             try:
                 await writer.drain()
-            except (ConnectionError, OSError):
+            except (ConnectionError, OSError) as exc:
+                log.warning("[%s] keepalive: drain failed, stopping: %r", call_id, exc)
                 break
             last_write[0] = time.monotonic()
+    log.info("[%s] keepalive writer exiting", call_id)
 
 
 async def handle_call(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
@@ -542,18 +529,17 @@ async def handle_call(reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     hangup_event = asyncio.Event()
     last_write = [time.monotonic()]
     state = {"is_agent_speaking": False, "interrupted": False, "speaking_started_at": 0.0}
-    keepalive_task = asyncio.create_task(keepalive_writer(writer, hangup_event, last_write, state))
+    keepalive_task = asyncio.create_task(keepalive_writer(call_id, writer, hangup_event, last_write, state))
 
     stt_ws = None
     try:
         stt_ws = await deepgram_stt_session()
         log.info("[%s] Deepgram STT session ready (model=%s, language=%s)", call_id, DEEPGRAM_MODEL, DEEPGRAM_LANGUAGE)
-        history = [{"role": "system", "content": AIAGENT_INSTRUCTIONS}]
         transcript_queue = asyncio.Queue()
         await asyncio.gather(
             pump_asterisk_to_stt(call_id, reader, stt_ws, hangup_event),
             pump_stt_transcripts(call_id, stt_ws, transcript_queue, state, hangup_event),
-            process_turns(call_id, transcript_queue, writer, hangup_event, state, last_write, history),
+            process_turns(call_id, transcript_queue, writer, hangup_event, state, last_write),
         )
     finally:
         hangup_event.set()

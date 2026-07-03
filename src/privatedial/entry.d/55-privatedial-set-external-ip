@@ -1,0 +1,23 @@
+#!/bin/sh
+#
+# 55-privatedial-set-external-ip
+#
+# Variables defined in Dockerfile:
+# DOCKER_CONF_DIR
+#
+
+#
+# Rewrites the PJSIP address fields to the current EXTERNAL_IP on every
+# container start (not gated on first-boot seeding like
+# 50-asterisk-seed-conf) - this value is deployment-specific and can
+# legitimately change across restarts (e.g. a cloud provider reassigning an
+# ephemeral IP), so it needs to converge on every boot rather than being
+# set once and left stale.
+#
+if [ -n "$EXTERNAL_IP" ]; then
+	dc_log 5 "Setting PJSIP external address to $EXTERNAL_IP"
+	sed -i -E "s/^(domain|external_signaling_address|external_media_address) = .*/\1 = $EXTERNAL_IP/" \
+		"$DOCKER_CONF_DIR/pjsip_transport.conf"
+	sed -i -E "s/^(endpoint\/media_address) = .*/\1 = $EXTERNAL_IP/" \
+		"$DOCKER_CONF_DIR/pjsip_wizard.conf"
+fi

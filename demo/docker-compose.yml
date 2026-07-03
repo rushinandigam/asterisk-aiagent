@@ -26,7 +26,7 @@ services:
       - /etc/localtime:/etc/localtime:ro    # Use host timezone
 
   aiagent-bridge:
-    build: ../src/aiagent/bridge          # AudioSocket <-> Deepgram STT / OpenAI LLM / ElevenLabs TTS bridge for extension 1001
+    build: ../src/aiagent/bridge          # AudioSocket <-> Deepgram STT / Agno agent / ElevenLabs TTS bridge for extension 1001
     network_mode: "service:tele"          # share tele's netns: reachable at 127.0.0.1:9092 (tele uses network_mode:bridge, no DNS)
     depends_on:
       - tele
